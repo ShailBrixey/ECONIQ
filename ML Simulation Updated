@@ -1,0 +1,255 @@
+import numpy as np
+import pandas as pd
+import pandas_datareader.data as web
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+
+
+# ============================================================
+# ECONOMIC INDICATOR DICTIONARY
+# ============================================================
+
+ECONOMIC_INDICATORS = {
+    "interest_rate": {
+        "fred_code": "FEDFUNDS",
+        "transformation": "diff",
+        "description": "Federal Funds Rate"
+    },
+    "inflation": {
+        "fred_code": "CPIAUCSL",
+        "transformation": "pct_change",
+        "description": "Consumer Price Index"
+    },
+    "gdp": {
+        "fred_code": "GDPC1",
+        "transformation": "pct_change",
+        "description": "Real GDP"
+    },
+    "unemployment": {
+        "fred_code": "UNRATE",
+        "transformation": "diff",
+        "description": "Unemployment Rate"
+    },
+    "money_supply": {
+        "fred_code": "M2SL",
+        "transformation": "log_diff",
+        "description": "M2 Money Stock"
+    },
+    "federal_debt": {
+        "fred_code": "GFDEBTN",
+        "transformation": "log_diff",
+        "description": "Federal Debt"
+    }
+}
+
+
+# ============================================================
+# DATA PIPELINE
+# ============================================================
+
+class DataPipeline:
+
+    def __init__(self, indicators):
+        self.indicators = indicators
+        self.scaler = MinMaxScaler()
+        self.feature_names = list(indicators.keys())
+
+    def fetch_data(self, start, end):
+        fred_codes = [v["fred_code"] for v in self.indicators.values()]
+
+        df = web.DataReader(fred_codes, "fred", start, end)
+        df.columns = self.feature_names
+
+        # Convert quarterly GDP to monthly
+        df = df.resample("MS").interpolate("linear")
+
+        return df
+
+    def transform(self, df):
+        transformed = pd.DataFrame(index=df.index)
+
+        for name, meta in self.indicators.items():
+            if meta["transformation"] == "diff":
+                transformed[name] = df[name].diff()
+
+            elif meta["transformation"] == "pct_change":
+                transformed[name] = df[name].pct_change()
+
+            elif meta["transformation"] == "log_diff":
+                transformed[name] = np.log(df[name]).diff()
+
+        return transformed.dropna()
+
+    def scale(self, df):
+        scaled = self.scaler.fit_transform(df)
+        return scaled
+
+    def inverse_scale(self, data):
+        return self.scaler.inverse_transform(data)
+
+
+# ============================================================
+# SEQUENCE BUILDER
+# ============================================================
+
+def build_sequences(data, window=12):
+    X, y = [], []
+
+    for i in range(window, len(data)):
+        X.append(data[i - window:i])
+        y.append(data[i])
+
+    return np.array(X), np.array(y)
+
+
+# ============================================================
+# LSTM MODEL
+# ============================================================
+
+def build_model(input_shape):
+
+    model = Sequential([
+        Input(shape=input_shape),
+
+        LSTM(64, return_sequences=True),
+        Dropout(0.2),
+
+        LSTM(32),
+        Dropout(0.2),
+
+        Dense(input_shape[-1])
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss="mean_squared_error"
+    )
+
+    return model
+
+
+# ============================================================
+# SCENARIO ENGINE
+# ============================================================
+
+def simulate(model, last_window, pipeline, steps=24, shocks=None):
+
+    current = last_window.copy()
+    results = []
+
+    feature_index = {name: idx for idx, name in enumerate(pipeline.feature_names)}
+
+    for step in range(steps):
+
+        pred = model.predict(current, verbose=0)
+
+        # -----------------------------------------
+        # Apply User Shocks (consistent keys)
+        # -----------------------------------------
+        if shocks:
+
+            if "inflation_override" in shocks:
+                pred[0, feature_index["inflation"]] = shocks["inflation_override"]
+
+            if "gdp_override" in shocks:
+                pred[0, feature_index["gdp"]] = shocks["gdp_override"]
+
+            if "money_supply_shock" in shocks:
+                pred[0, feature_index["money_supply"]] += shocks["money_supply_shock"]
+
+            if "interest_rate_override" in shocks:
+                pred[0, feature_index["interest_rate"]] = shocks["interest_rate_override"]
+
+        # -----------------------------------------
+        # Basic Drift Control (prevents explosion)
+        # -----------------------------------------
+        pred = np.clip(pred, -0.20, 0.20)
+
+        results.append(pred[0])
+
+        # Sliding window update
+        current = np.concatenate(
+            [current[:, 1:], pred[:, None, :]],
+            axis=1
+        )
+
+    results = np.array(results)
+
+    # Inverse scale before returning
+    results_inverse = pipeline.inverse_scale(results)
+
+    return results_inverse
+
+
+# ============================================================
+# RUN FULL PIPELINE
+# ============================================================
+
+if __name__ == "__main__":
+
+    pipeline = DataPipeline(ECONOMIC_INDICATORS)
+
+    # 1. Fetch raw macro data
+    raw_data = pipeline.fetch_data("1970-01-01", "2025-01-01")
+
+    # 2. Transform to stationary form
+    transformed = pipeline.transform(raw_data)
+
+    # 3. Scale
+    scaled = pipeline.scale(transformed)
+
+    # 4. Build sequences
+    X, y = build_sequences(scaled, window=12)
+
+    # 5. Train model
+    model = build_model((12, X.shape[2]))
+
+    model.fit(
+        X,
+        y,
+        epochs=20,
+        batch_size=32,
+        verbose=1
+    )
+
+    # 6. Baseline forecast
+    baseline = simulate(
+        model,
+        X[-1:],
+        pipeline,
+        steps=12
+    )
+
+    # 7. Inflation Shock Scenario
+    inflation_shock = simulate(
+        model,
+        X[-1:],
+        pipeline,
+        steps=12,
+        shocks={"inflation_override": 0.08}
+    )
+
+    # 8. Money Contraction Scenario
+    austerity = simulate(
+        model,
+        X[-1:],
+        pipeline,
+        steps=24,
+        shocks={"money_supply_shock": -0.05}
+    )
+
+    # 9. Productivity Boom Scenario
+    boom = simulate(
+        model,
+        X[-1:],
+        pipeline,
+        steps=12,
+        shocks={
+            "gdp_override": 0.04,
+            "inflation_override": 0.02
+        }
+    )
+
+    print("Baseline Forecast (first 3 months):")
+    print(baseline[:3])
