@@ -1,48 +1,56 @@
+import os
 import numpy as np
 import pandas as pd
-import pandas_datareader.data as web
+import matplotlib.pyplot as plt
+from fredapi import Fred
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
 
+# ============================================================
+# CONFIG
+# ============================================================
+
+FRED_API_KEY = "fa2afb466f7b43f74136f01fd2cc7c9a"
+fred = Fred(api_key=FRED_API_KEY)
 
 # ============================================================
-# ECONOMIC INDICATOR DICTIONARY
+# ECONOMIC INDICATORS
 # ============================================================
 
 ECONOMIC_INDICATORS = {
-    "interest_rate": {
-        "fred_code": "FEDFUNDS",
-        "transformation": "diff",
-        "description": "Federal Funds Rate"
-    },
-    "inflation": {
-        "fred_code": "CPIAUCSL",
-        "transformation": "pct_change",
-        "description": "Consumer Price Index"
-    },
-    "gdp": {
-        "fred_code": "GDPC1",
-        "transformation": "pct_change",
-        "description": "Real GDP"
-    },
-    "unemployment": {
-        "fred_code": "UNRATE",
-        "transformation": "diff",
-        "description": "Unemployment Rate"
-    },
-    "money_supply": {
-        "fred_code": "M2SL",
-        "transformation": "log_diff",
-        "description": "M2 Money Stock"
-    },
-    "federal_debt": {
-        "fred_code": "GFDEBTN",
-        "transformation": "log_diff",
-        "description": "Federal Debt"
-    }
+    "interest_rate": {"fred_code": "FEDFUNDS", "transformation": "diff"},
+    "inflation": {"fred_code": "CPIAUCSL", "transformation": "pct_change"},
+    "gdp": {"fred_code": "GDPC1", "transformation": "pct_change"},
+    "unemployment": {"fred_code": "UNRATE", "transformation": "diff"},
+    "money_supply": {"fred_code": "M2SL", "transformation": "log_diff"},
+    "federal_debt": {"fred_code": "GFDEBTN", "transformation": "log_diff"}
 }
 
+# ============================================================
+# DATASET DOCUMENTATION
+# ============================================================
+
+def print_dataset_info():
+
+    print("\nDATASET SOURCES\n")
+
+    datasets = [
+        ("Federal Funds Rate","FEDFUNDS","https://fred.stlouisfed.org/series/FEDFUNDS","1954-Present"),
+        ("Consumer Price Index","CPIAUCSL","https://fred.stlouisfed.org/series/CPIAUCSL","1947-Present"),
+        ("Real GDP","GDPC1","https://fred.stlouisfed.org/series/GDPC1","1947-Present"),
+        ("Unemployment Rate","UNRATE","https://fred.stlouisfed.org/series/UNRATE","1948-Present"),
+        ("M2 Money Supply","M2SL","https://fred.stlouisfed.org/series/M2SL","1959-Present"),
+        ("Federal Debt","GFDEBTN","https://fred.stlouisfed.org/series/GFDEBTN","1966-Present")
+    ]
+
+    for d in datasets:
+        print(f"Dataset: {d[0]}")
+        print(f"API Code: {d[1]}")
+        print(f"Link: {d[2]}")
+        print(f"Year Range: {d[3]}\n")
 
 # ============================================================
 # DATA PIPELINE
@@ -56,20 +64,52 @@ class DataPipeline:
         self.feature_names = list(indicators.keys())
 
     def fetch_data(self, start, end):
-        fred_codes = [v["fred_code"] for v in self.indicators.values()]
 
-        df = web.DataReader(fred_codes, "fred", start, end)
-        df.columns = self.feature_names
+        series_dict = {}
 
-        # Convert quarterly GDP to monthly
-        df = df.resample("MS").interpolate("linear")
+        for name, meta in self.indicators.items():
+
+            series = fred.get_series(
+                meta["fred_code"],
+                observation_start=start,
+                observation_end=end
+            )
+
+            series.index = pd.to_datetime(series.index)
+            series_dict[name] = series
+
+        # FORCE COMMON DATE RANGE
+
+        start_dates = [s.dropna().index.min() for s in series_dict.values()]
+        end_dates = [s.dropna().index.max() for s in series_dict.values()]
+
+        common_start = max(start_dates)
+        common_end = min(end_dates)
+
+        print("\nCommon window:")
+        print(common_start, "to", common_end)
+
+        for name in series_dict:
+            series_dict[name] = series_dict[name].loc[common_start:common_end]
+
+        df = pd.DataFrame(series_dict)
+
+        # Monthly alignment
+        df = df.resample("MS").interpolate()
+
+        # Convert debt to billions
+        df["federal_debt"] = df["federal_debt"] / 1000
+
+        df = df.dropna()
 
         return df
 
     def transform(self, df):
+
         transformed = pd.DataFrame(index=df.index)
 
         for name, meta in self.indicators.items():
+
             if meta["transformation"] == "diff":
                 transformed[name] = df[name].diff()
 
@@ -82,174 +122,180 @@ class DataPipeline:
         return transformed.dropna()
 
     def scale(self, df):
-        scaled = self.scaler.fit_transform(df)
-        return scaled
+        return self.scaler.fit_transform(df)
 
     def inverse_scale(self, data):
         return self.scaler.inverse_transform(data)
 
+# ============================================================
+# GRAPHING
+# ============================================================
+
+def plot_dataframe(df, title):
+
+    df.plot(figsize=(12,6))
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+def plot_forecast(forecast_array, feature_names):
+
+    df_forecast = pd.DataFrame(forecast_array, columns=feature_names)
+    df_forecast.plot(figsize=(12,6))
+    plt.title("Forecast Output")
+    plt.grid(True)
+    plt.show()
+
+# ============================================================
+# REGRESSION ANALYSIS
+# ============================================================
+
+def regression_analysis(df):
+
+    print("\nRunning regression analysis...\n")
+
+    # SIMPLE REGRESSION
+    X_simple = df[["money_supply"]]
+    y_simple = df["inflation"]
+
+    model_simple = LinearRegression()
+    model_simple.fit(X_simple, y_simple)
+
+    pred_simple = model_simple.predict(X_simple)
+
+    plt.figure()
+    plt.scatter(X_simple, y_simple)
+    plt.plot(X_simple, pred_simple)
+    plt.title("Simple Regression: Inflation vs Money Supply")
+    plt.show()
+
+    # MULTIVARIATE REGRESSION
+    X_multi = df[["money_supply","gdp","interest_rate","unemployment"]]
+    y_multi = df["inflation"]
+
+    model_multi = LinearRegression()
+    model_multi.fit(X_multi, y_multi)
+
+    print("Multivariate Coefficients:")
+    print(model_multi.coef_)
+
+    pred_multi = model_multi.predict(X_multi)
+
+    plt.figure()
+    plt.plot(y_multi.values,label="Actual")
+    plt.plot(pred_multi,label="Predicted")
+    plt.title("Multivariate Regression Prediction")
+    plt.legend()
+    plt.show()
 
 # ============================================================
 # SEQUENCE BUILDER
 # ============================================================
 
 def build_sequences(data, window=12):
+
     X, y = [], []
 
-    for i in range(window, len(data)):
-        X.append(data[i - window:i])
+    for i in range(window,len(data)):
+        X.append(data[i-window:i])
         y.append(data[i])
 
     return np.array(X), np.array(y)
 
-
 # ============================================================
-# LSTM MODEL
+# MODEL
 # ============================================================
 
 def build_model(input_shape):
 
     model = Sequential([
         Input(shape=input_shape),
-
         LSTM(64, return_sequences=True),
         Dropout(0.2),
-
         LSTM(32),
         Dropout(0.2),
-
         Dense(input_shape[-1])
     ])
 
-    model.compile(
-        optimizer="adam",
-        loss="mean_squared_error"
-    )
+    model.compile(optimizer="adam",loss="mse")
 
     return model
 
-
 # ============================================================
-# SCENARIO ENGINE
+# FORECAST SIMULATION
 # ============================================================
 
-def simulate(model, last_window, pipeline, steps=24, shocks=None):
+def simulate(model,last_window,pipeline,steps=12):
 
     current = last_window.copy()
     results = []
 
-    feature_index = {name: idx for idx, name in enumerate(pipeline.feature_names)}
+    for _ in range(steps):
 
-    for step in range(steps):
-
-        pred = model.predict(current, verbose=0)
-
-        # -----------------------------------------
-        # Apply User Shocks (consistent keys)
-        # -----------------------------------------
-        if shocks:
-
-            if "inflation_override" in shocks:
-                pred[0, feature_index["inflation"]] = shocks["inflation_override"]
-
-            if "gdp_override" in shocks:
-                pred[0, feature_index["gdp"]] = shocks["gdp_override"]
-
-            if "money_supply_shock" in shocks:
-                pred[0, feature_index["money_supply"]] += shocks["money_supply_shock"]
-
-            if "interest_rate_override" in shocks:
-                pred[0, feature_index["interest_rate"]] = shocks["interest_rate_override"]
-
-        # -----------------------------------------
-        # Basic Drift Control (prevents explosion)
-        # -----------------------------------------
-        pred = np.clip(pred, -0.20, 0.20)
+        pred = model.predict(current,verbose=0)
+        pred = np.clip(pred,-0.2,0.2)
 
         results.append(pred[0])
 
-        # Sliding window update
         current = np.concatenate(
-            [current[:, 1:], pred[:, None, :]],
+            [current[:,1:],pred[:,None,:]],
             axis=1
         )
 
     results = np.array(results)
 
-    # Inverse scale before returning
-    results_inverse = pipeline.inverse_scale(results)
-
-    return results_inverse
-
+    return pipeline.inverse_scale(results)
 
 # ============================================================
-# RUN FULL PIPELINE
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
+    print_dataset_info()
+
     pipeline = DataPipeline(ECONOMIC_INDICATORS)
 
-    # 1. Fetch raw macro data
-    raw_data = pipeline.fetch_data("1970-01-01", "2025-01-01")
+    print("\nFetching data...")
+    raw_data = pipeline.fetch_data("1970-01-01","2025-01-01")
 
-    # 2. Transform to stationary form
+    plot_dataframe(raw_data,"Raw Macroeconomic Data")
+
+    print("\nTransforming...")
     transformed = pipeline.transform(raw_data)
 
-    # 3. Scale
+    plot_dataframe(transformed,"Stationary Data")
+
+    # REGRESSION ANALYSIS
+    regression_analysis(transformed)
+
+    # SCALE DATA
     scaled = pipeline.scale(transformed)
 
-    # 4. Build sequences
-    X, y = build_sequences(scaled, window=12)
+    X,y = build_sequences(scaled,window=12)
 
-    # 5. Train model
-    model = build_model((12, X.shape[2]))
+    # TRAIN / TEST SPLIT
+    split = int(len(X)*0.8)
 
-    model.fit(
-        X,
-        y,
-        epochs=20,
-        batch_size=32,
-        verbose=1
-    )
+    X_train = X[:split]
+    X_test = X[split:]
 
-    # 6. Baseline forecast
-    baseline = simulate(
-        model,
-        X[-1:],
-        pipeline,
-        steps=12
-    )
+    y_train = y[:split]
+    y_test = y[split:]
 
-    # 7. Inflation Shock Scenario
-    inflation_shock = simulate(
-        model,
-        X[-1:],
-        pipeline,
-        steps=12,
-        shocks={"inflation_override": 0.08}
-    )
+    print("\nTraining LSTM model...")
 
-    # 8. Money Contraction Scenario
-    austerity = simulate(
-        model,
-        X[-1:],
-        pipeline,
-        steps=24,
-        shocks={"money_supply_shock": -0.05}
-    )
+    model = build_model((12,X.shape[2]))
 
-    # 9. Productivity Boom Scenario
-    boom = simulate(
-        model,
-        X[-1:],
-        pipeline,
-        steps=12,
-        shocks={
-            "gdp_override": 0.04,
-            "inflation_override": 0.02
-        }
-    )
+    model.fit(X_train,y_train,epochs=15,batch_size=32,verbose=1)
 
-    print("Baseline Forecast (first 3 months):")
-    print(baseline[:3])
+    # PREDICTION
+    preds = model.predict(X_test)
+
+    rmse = np.sqrt(mean_squared_error(y_test,preds))
+    print("\nForecast RMSE:",rmse)
+
+    # FORECAST FUTURE
+    forecast = simulate(model,X[-1:],pipeline,steps=12)
+
+    plot_forecast(forecast,pipeline.feature_names)
